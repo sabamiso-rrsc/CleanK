@@ -132,7 +132,3 @@ Email → cleanK [at] example.com
 Stay updated by starring ⭐ the repo and watching for releases.
 
 <sub>© 2025 CleanK Project — Built with ❤️ and a mild obsession for sparkling tile floors.</sub>
-
-pgsql
-Copy
-Edit
