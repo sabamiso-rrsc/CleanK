@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from pathlib import Path
 import csv, json
 from datetime import datetime
@@ -5,11 +8,12 @@ from datetime import datetime
 import os
 import sys
 import time
+import glob
 import serial
 import threading
+from queue import SimpleQueue
 
 from DM_CAN import *
-from pynput import keyboard  # Ubuntu でも sudo 不要で扱いやすいグローバルキーフック
 
 # ================= パラメータ =================
 maxTorque = 10.0
@@ -21,37 +25,65 @@ def default_serial_port():
     env = os.getenv("DM_PORT")
     if env:
         return env
+
     if sys.platform.startswith("win"):
         return "COM7"
-    # Linux の一般的な候補
+
+    if sys.platform == "darwin":  # macOS
+        patterns = [
+            "/dev/cu.usbmodem*",
+            "/dev/cu.usbserial*",
+            "/dev/cu.SLAB_USBtoUART*",
+            "/dev/cu.wchusbserial*",
+        ]
+        for pat in patterns:
+            cand = sorted(glob.glob(pat))
+            if cand:
+                return cand[0]
+        # 最後の保険（ユーザ実機に合わせたい場合は環境変数 DM_PORT を使う）
+        return "/dev/cu.usbmodem00000000050C1"
+
+    # Linux 一般
     for cand in ("/dev/ttyACM0", "/dev/ttyUSB0"):
         if os.path.exists(cand):
             return cand
-    return "/dev/cu.usbmodem00000000050C1"
+    return "/dev/ttyACM0"
 
-# ================= キー入力（pynput） =================
-s_pressed_event = threading.Event()   # s が押された
-s_released_event = threading.Event()  # s が離された（押下後のリリース検出用）
+# ================= 入力（stdin） =================
+# - 別スレッドで sys.stdin を1行ずつ読んで合図をキューに投げる
+# - 's' でトグル、'q' で終了
+#   （sys.stdin について: 標準入力の読み取りは Text IO で行/反復可能。:contentReference[oaicite:1]{index=1}）
+cmd_queue: SimpleQueue[str] = SimpleQueue()
+shutdown_evt = threading.Event()
 
-def on_press(key):
-    try:
-        ch = getattr(key, "char", None)
-        if ch and ch.lower() == "s":
-            s_pressed_event.set()
-            s_released_event.clear()
-    except Exception:
-        pass
+def stdin_watcher():
+    # TTYでない場合でも、パイプ/リダイレクトされた入力をそのまま読みます
+    for line in sys.stdin:
+        txt = line.strip().lower()
+        if not txt:
+            continue
+        if "q" in txt:
+            cmd_queue.put("q")
+            break
+        if "s" in txt:
+            cmd_queue.put("s")
+    # ここに到達＝EOF
+    shutdown_evt.set()
 
-def on_release(key):
-    try:
-        ch = getattr(key, "char", None)
-        if ch and ch.lower() == "s":
-            s_released_event.set()
-    except Exception:
-        pass
-
-listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-listener.start()  # 非ブロッキングで開始（メインループは継続）
+def wait_for_cmd(target: str):
+    """cmd_queue から target ('s' or 'q') を待つ（到達までブロック）"""
+    while True:
+        # shutdown 要求が来たら即終了
+        if shutdown_evt.is_set():
+            return "q"
+        try:
+            cmd = cmd_queue.get(timeout=0.05)
+            if cmd == target:
+                return cmd
+            if cmd == "q":
+                return "q"
+        except Exception:
+            pass
 
 # ================= 制御関数 =================
 def MITMaxTorque(Motor, target_angle: float, kp: float, target_vel: float, kd: float):
@@ -75,6 +107,8 @@ Motor4 = Motor(DM_Motor_Type.DM6006, 0x04, 0x15)
 Motor5 = Motor(DM_Motor_Type.DM4310, 0x05, 0x11)
 
 serial_device = serial.Serial(default_serial_port(), 921600, timeout=0.5)
+print("Serial port is open:", getattr(serial_device, "port", "?"))
+
 MotorControl1 = MotorControl(serial_device)
 for m in (Motor1, Motor2, Motor3, Motor4, Motor5):
     MotorControl1.addMotor(m)
@@ -103,27 +137,32 @@ MotorControl1.set_zero_position(Motor3)
 MotorControl1.set_zero_position(Motor4)
 MotorControl1.set_zero_position(Motor5)
 
-# ここは元コード通り：各軸に一度 MIT(3,0,0,0,0) を投げる
+# 一度だけ MIT(3,0,0,0,0) を投げる
 MotorControl1.controlMIT(Motor1, 3, 0, 0, 0, 0)
 MotorControl1.controlMIT(Motor2, 3, 0, 0, 0, 0)
 MotorControl1.controlMIT(Motor3, 3, 0, 0, 0, 0)
 MotorControl1.controlMIT(Motor4, 3, 0, 0, 0, 0)
 MotorControl1.controlMIT(Motor5, 3, 0, 0, 0, 0)
 
-print("recording start (press 's' to stop)")
-
-data = []
-
+# ================= 記録＆再生 =================
 record_dir = Path("recordings")
 record_dir.mkdir(exist_ok=True)
-log_rows = []                 # CSV用のフラット化データ
-t0 = time.perf_counter()      # 経過時間[s]を出す基準
 
+data = []        # 再生用（ネスト構造）
+log_rows = []    # CSV用（フラット）
+t0 = time.perf_counter()
+
+# stdin 監視スレッド起動（Event/Queue を使うのはスレッド連携の基本。:contentReference[oaicite:2]{index=2}）
+th = threading.Thread(target=stdin_watcher, daemon=True)
+th.start()
+
+print("\nrecording start  ——  停止するには  s + Enter 。（終了は q + Enter）")
+
+scale = 1.0  # 減衰後の“原点寄せ”で使う既定値
 
 try:
-    # -------- 記録：s が押されるまで --------
-    s_pressed_event.clear()
-    while not s_pressed_event.is_set():
+    # -------- 記録：'s' が来るまで --------
+    while True:
         # 目標0でMIT制御しつつ、各モータの pos/vel を取得
         MotorControl1.controlMIT(Motor1, 0, 0, 0, 0, 0)
         MotorControl1.controlMIT(Motor2, 0, 0, 0, 0, 0)
@@ -140,19 +179,25 @@ try:
         ]
         data.append(frame)
 
-        # 追加 ↓（CSV 1行ぶん: [t, m1_pos, m1_vel, ..., m5_pos, m5_vel]）
+        # CSV 1行ぶん: [t, m1_pos, m1_vel, ..., m5_pos, m5_vel]
         t = time.perf_counter() - t0
         row = [t] + [x for pair in frame for x in pair]
         log_rows.append(row)
 
-        print(frame[3])  # 元コードに合わせ Motor4 の pos/vel を表示
+        # 100 Hz 目安
         time.sleep(0.01)
+
+        # 入力チェック
+        if not cmd_queue.empty():
+            cmd = cmd_queue.get_nowait()
+            if cmd == "s":
+                break
+            if cmd == "q":
+                raise KeyboardInterrupt
 
     print("recording stopped")
 
-
-
-    # 追加 ↓ 保存（CSV と メタ）
+    # -------- 保存（CSV と メタ）--------
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     csv_path = record_dir / f"cleank1_chunk_{ts}.csv"
     hdr = ["t_s"] + [f"m{i}_{k}" for i in range(1, 6) for k in ("pos", "vel")]
@@ -160,6 +205,7 @@ try:
         w = csv.writer(f)
         w.writerow(hdr)
         w.writerows(log_rows)
+
     meta = {
         "motors": [
             {"id": 1, "type": "DM4310"}, {"id": 2, "type": "DM6006"},
@@ -175,18 +221,18 @@ try:
         json.dump(meta, f, indent=2)
     print(f"saved: {csv_path}")
 
-    # -------- 元コード相当：s を離し、再度 s が押されるのを待つ --------
-    # s リリース待ち
-    while not s_released_event.is_set():
-        time.sleep(0.005)
-    # 次の s 押下待ち
-    s_pressed_event.clear()
-    while not s_pressed_event.is_set():
-        time.sleep(0.005)
+    print("\n再生を始めるには  s + Enter。終了は q + Enter。")
+
+    # -------- 's' を待って再生開始 --------
+    cmd = wait_for_cmd("s")
+    if cmd == "q":
+        raise KeyboardInterrupt
 
     # -------- 無限ループで再生＋減衰＋原点戻し＋待ち --------
     while True:
         print("moving start")
+
+        # 記録シーケンスの再生（速度は半分）
         for l in data:
             MITMaxTorque(Motor1, l[0][0], K_p,       l[0][1] / 2.0, 1.0)
             MITMaxTorque(Motor2, l[1][0], K_p,       l[1][1] / 2.0, 1.0)
@@ -194,20 +240,23 @@ try:
             MITMaxTorque(Motor4, l[3][0], K_p,       l[3][1] / 2.0, 1.0)
             MITMaxTorque(Motor5, l[4][0], K_p,       l[4][1] / 2.0, 1.0)
             time.sleep(0.02)
+            if not cmd_queue.empty() and cmd_queue.get_nowait() == "q":
+                raise KeyboardInterrupt
 
         time.sleep(1.0)
 
-        # 減衰フェーズ
+        # 減衰フェーズ（KP, KD を指数で落とす）
         last = data[-1]
         for i in range(90):
             scale = (0.9 ** i)
-            print(K_p * scale)
             MITMaxTorque(Motor1, last[0][0], K_p * scale, last[0][1], scale)
             MITMaxTorque(Motor2, last[1][0], K_p * scale, last[1][1], scale)
             MITMaxTorque(Motor3, last[2][0], K_p * scale, last[2][1], scale)
             MITMaxTorque(Motor4, last[3][0], K_p * scale, last[3][1], scale)
             MITMaxTorque(Motor5, last[4][0], K_p * scale, last[4][1], scale)
             time.sleep(0.05)
+            if not cmd_queue.empty() and cmd_queue.get_nowait() == "q":
+                raise KeyboardInterrupt
 
         # 最後に原点へ軽く寄せる（KP低め）
         MITMaxTorque(Motor1, 0.0, 0.5, 0.0, scale)
@@ -216,7 +265,15 @@ try:
         MITMaxTorque(Motor4, 0.0, 0.5, 0.0, scale)
         MITMaxTorque(Motor5, 0.0, 0.5, 0.0, scale)
 
-        time.sleep(10.0)
+        # 10秒待機中に 'q' 監視
+        t_wait = time.time() + 10.0
+        while time.time() < t_wait:
+            if not cmd_queue.empty() and cmd_queue.get_nowait() == "q":
+                raise KeyboardInterrupt
+            time.sleep(0.05)
+
+except KeyboardInterrupt:
+    print("\n[KeyboardInterrupt] stopping...")
 
 finally:
     # 安全停止 & クリーンアップ
@@ -229,9 +286,5 @@ finally:
         serial_device.close()
     except Exception:
         pass
-    try:
-        listener.stop()
-    except Exception:
-        pass
-
-
+    shutdown_evt.set()
+    print("done. bye.")
