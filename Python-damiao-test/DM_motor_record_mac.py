@@ -13,7 +13,8 @@ import serial
 import threading
 from queue import SimpleQueue
 
-from DM_CAN import *
+from DM_CAN import Motor, MotorControl, DM_Motor_Type, Control_Type
+from utils import Rate
 
 # ================= パラメータ =================
 maxTorque = 10.0
@@ -150,7 +151,6 @@ record_dir.mkdir(exist_ok=True)
 
 data = []        # 再生用（ネスト構造）
 log_rows = []    # CSV用（フラット）
-t0 = time.perf_counter()
 
 # stdin 監視スレッド起動（Event/Queue を使うのはスレッド連携の基本。:contentReference[oaicite:2]{index=2}）
 th = threading.Thread(target=stdin_watcher, daemon=True)
@@ -162,6 +162,8 @@ scale = 1.0  # 減衰後の“原点寄せ”で使う既定値
 
 try:
     # -------- 記録：'s' が来るまで --------
+    record_rate = Rate(frequency_hz=100.0)
+    t0 = record_rate.reset()
     while True:
         # 目標0でMIT制御しつつ、各モータの pos/vel を取得
         MotorControl1.controlMIT(Motor1, 0, 0, 0, 0, 0)
@@ -180,12 +182,13 @@ try:
         data.append(frame)
 
         # CSV 1行ぶん: [t, m1_pos, m1_vel, ..., m5_pos, m5_vel]
-        t = time.perf_counter() - t0
+        t = record_rate._next_deadline - t0
         row = [t] + [x for pair in frame for x in pair]
         log_rows.append(row)
 
-        # 100 Hz 目安
-        time.sleep(0.01)
+        overrun = record_rate.sleep()
+        if overrun > 0.002:
+            print(f"[warn] record loop overrun {overrun * 1e3:.1f} ms", file=sys.stderr)
 
         # 入力チェック
         if not cmd_queue.empty():
@@ -231,6 +234,8 @@ try:
     # -------- 無限ループで再生＋減衰＋原点戻し＋待ち --------
     while True:
         print("moving start")
+        playback_rate = Rate(frequency_hz=50)
+        playback_rate.reset()
 
         # 記録シーケンスの再生（速度は半分）
         for l in data:
@@ -239,7 +244,9 @@ try:
             MITMaxTorque(Motor3, l[2][0], K_p,       l[2][1] / 2.0, 1.0)
             MITMaxTorque(Motor4, l[3][0], K_p,       l[3][1] / 2.0, 1.0)
             MITMaxTorque(Motor5, l[4][0], K_p,       l[4][1] / 2.0, 1.0)
-            time.sleep(0.02)
+            overrun = playback_rate.sleep()
+            if overrun > 0.004:
+                print(f"[warn] playback loop overrun {overrun * 1e3:.1f} ms", file=sys.stderr)
             if not cmd_queue.empty() and cmd_queue.get_nowait() == "q":
                 raise KeyboardInterrupt
 
@@ -247,6 +254,8 @@ try:
 
         # 減衰フェーズ（KP, KD を指数で落とす）
         last = data[-1]
+        damp_rate = Rate(frequency_hz=10)
+        damp_rate.reset()
         for i in range(90):
             scale = (0.9 ** i)
             MITMaxTorque(Motor1, last[0][0], K_p * scale, last[0][1], scale)
@@ -254,7 +263,9 @@ try:
             MITMaxTorque(Motor3, last[2][0], K_p * scale, last[2][1], scale)
             MITMaxTorque(Motor4, last[3][0], K_p * scale, last[3][1], scale)
             MITMaxTorque(Motor5, last[4][0], K_p * scale, last[4][1], scale)
-            time.sleep(0.05)
+            overrun = damp_rate.sleep()
+            if overrun > 0.004:
+                print(f"[warn] damping loop overrun {overrun * 1e3:.1f} ms", file=sys.stderr)
             if not cmd_queue.empty() and cmd_queue.get_nowait() == "q":
                 raise KeyboardInterrupt
 
