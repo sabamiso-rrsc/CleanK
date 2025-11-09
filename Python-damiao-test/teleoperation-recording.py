@@ -20,6 +20,12 @@ from utils import Rate
 maxTorque = 10.0
 K_p = 20.0
 
+
+controllerid = 0x0f
+
+motorid = 1
+motorid2 = 2
+
 # ================= ユーティリティ =================
 def default_serial_port():
     """環境変数 DM_PORT 優先。未指定なら OS に応じて推定。"""
@@ -191,24 +197,44 @@ try:
     t0 = record_rate.reset()
     while True:
         # 目標0でMIT制御しつつ、各モータの pos/vel を取得
-        MotorControl1.controlMIT(Motor1, 0, 0, 0, 0, 0)
-        MotorControl1.controlMIT(Motor2, 0, 0, 0, 0, 0)
-        MotorControl1.controlMIT(Motor3, 0, 0, 0, 0, 0)
-        MotorControl1.controlMIT(Motor4, 0, 0, 0, 0, 0)
-        MotorControl1.controlMIT(Motor5, 0, 0, 0, 0, 0)
+        l=[]
+        if True:        #インデントずらして見やすくした
+            #lのデータ形式      (更新前)
+            #[lDM1, lDM2, lDM3, lDM4, lDM5, lSTS1, lSTS2]
+            MotorControl4.STSControl_read(controllerid, motorid)        #leader sts id=1 read(同時に二つやると処理が追い付かなくなる)
+            for i in range(5):          #leader DM motors read
+                MotorControl3.controlMIT(motorlist[i], 0, 0, 0, 0,  0)
 
-        frame = [
-            [Motor1.getPosition(), Motor1.getVelocity()],
-            [Motor2.getPosition(), Motor2.getVelocity()],
-            [Motor3.getPosition(), Motor3.getVelocity()],
-            [Motor4.getPosition(), Motor4.getVelocity()],
-            [Motor5.getPosition(), Motor5.getVelocity()],
-        ]
-        data.append(frame)
+            time.sleep(0.005)
+            
+            MotorControl3.recv()   #leader DM motors recv (値の取得命令送信後、値が返ってくるまでタイムラグあり)
+            for i in range(5):
+                l.append(motorlist2[i].getPosition())   #leader DM motors position append
+            MotorControl4.STSControl_read(controllerid, motorid2)   #leader sts id=2 read （同時に二つやると処理が追い付かなくなる）
+            l.append(MotorControl4.sts_map[motorid])        #leader sts id=1 position append (id=1(１つ目のモーターの値が返ってくるのがこのぐらいと予想))
+            MotorControl2.STSControl_write(controllerid, motorid, l[5])   #follower sts id=1 write(値戻ってきたのでfollowerに書く)
+            
+            for i in range(5):
+                MITMaxTorque(MotorControl1, motorlist[i], l[i], K_p, 0, 1)
+            
+            ###
+            ###ここで、followerの角度を受け取る
+            ###
+
+            MotorControl4.recv()   #leader STS recv(id=2) (値の取得命令送信後、値が返ってくるまでタイムラグあり)
+            l.append( MotorControl4.sts_map[motorid2])      #leader sts id=2 position append
+            MotorControl2.STSControl_write(controllerid, motorid2, l[6])    #follower sts id=2 write(値戻ってきたのでfollowerに送信)
+
+
+
+        data.append(l)
+
+        #本来保存するべきデータは、follower_pos{1 2 3 4 5 sts1 sts2} leader_pos{1 2 3 4 5 sts1 sts2}
+        #まだ作れてない
 
         # CSV 1行ぶん: [t, m1_pos, m1_vel, ..., m5_pos, m5_vel]
         t = record_rate._next_deadline - t0
-        row = [t] + [x for pair in frame for x in pair]
+        row = [t] + [x for pair in l for x in pair]
         log_rows.append(row)
 
         overrun = record_rate.sleep()
@@ -236,8 +262,8 @@ try:
 
     meta = {
         "motors": [
-            {"id": 1, "type": "DM4310"}, {"id": 2, "type": "DM6006"},
-            {"id": 3, "type": "DM4310"}, {"id": 4, "type": "DM6006"},
+            {"id": 1, "type": "DM6006"}, {"id": 2, "type": "DM6006"},
+            {"id": 3, "type": "DM4310"}, {"id": 4, "type": "DM4310"},
             {"id": 5, "type": "DM4310"},
         ],
         "fps_nominal": 100,
