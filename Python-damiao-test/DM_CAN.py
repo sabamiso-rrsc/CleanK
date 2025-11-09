@@ -61,7 +61,15 @@ class Motor:
             return self.temp_param_dict[RID]
         else:
             return None
+        
+class STSMotor :
+    def __init__(self, motorid):
+        self.motorid = motorid
+        self.position = int()
 
+    def getPosition(self):
+        return self.position
+    
 
 class MotorControl:
     send_data_frame = np.array(
@@ -81,12 +89,40 @@ class MotorControl:
         """
         self.serial_ = serial_device
         self.motors_map = dict()
+        self.sts_map = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         self.data_save = bytes()  # save data
         if self.serial_.is_open:  # open the serial port
             print("Serial port is open")
             serial_device.close()
         self.serial_.open()
+    
+    def STSControl_write(self, controller_id, id, angle):
+        data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
+        data_buf[0] = (id >> 8) & 0xff
+        data_buf[1] = id & 0xff
+        data_buf[2] = (angle >> 8) & 0xff
+        data_buf[3] = angle & 0xff
+        data_buf[4] = 0
+        data_buf[5] = 0xff
+        data_buf[6] = 0
+        data_buf[7] = 0
+        self.__send_data(controller_id, data_buf)
+        #self.recv()  # receive the data from serial port
 
+    def STSControl_read(self, controller_id, id):
+        data_buf = np.array([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], np.uint8)
+        data_buf[0] = (id >> 8) & 0xff
+        data_buf[1] = id & 0xff
+        data_buf[2] = 0
+        data_buf[3] = 0
+        data_buf[4] = 0xff
+        data_buf[5] = 0
+        data_buf[6] = 0
+        data_buf[7] = 0
+        self.__send_data(controller_id, data_buf)
+        self.recv()  # receive the data from serial port
+        return self.sts_map[id]
+    
     def controlMIT(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float):
         """
         MIT Control Mode Function 达妙电机MIT控制模式函数
@@ -240,6 +276,7 @@ class MotorControl:
     def recv(self):
         # 把上次没有解析完的剩下的也放进来
         data_recv = b''.join([self.data_save, self.serial_.read_all()])
+        #print("data_recv:", data_recv)
         packets = self.__extract_packets(data_recv)
         for packet in packets:
             data = packet[7:15]
@@ -257,6 +294,7 @@ class MotorControl:
             self.__process_set_param_packet(data, CANID, CMD)
 
     def __process_packet(self, data, CANID, CMD):
+        #print("recv data:", data, " CANID:", hex(CANID), " CMD:", hex(CMD))
         if CMD == 0x11:
             if CANID != 0x00:
                 if CANID in self.motors_map:
@@ -271,6 +309,11 @@ class MotorControl:
                     recv_dq = uint_to_float(dq_uint, -DQ_MAX, DQ_MAX, 12)
                     recv_tau = uint_to_float(tau_uint, -TAU_MAX, TAU_MAX, 12)
                     self.motors_map[CANID].recv_data(recv_q, recv_dq, recv_tau)
+                elif CANID == 0xff00:
+                    motorid = data[0]
+                    q_uint = np.uint16((np.uint16(data[1]) << 8) | data[2])
+                    self.sts_map[motorid]=q_uint
+                    
             else:
                 MasterID=data[0] & 0x0f
                 if MasterID in self.motors_map:
