@@ -203,7 +203,7 @@ def main():
             l = []
 
             # Leader STS (id=1) read first (avoid overlapping commands)
-            MCC_l_sts.STSControl_read(CONTROLLER_ID, STS_ID_1)
+            sts1_val = motor_stream.read_angle(1)
 
             # Leader DM request current state (send)
             for i in range(5):
@@ -217,29 +217,25 @@ def main():
                 l.append(LEADER_DM_MOTORS[i].getPosition())  # 5 entries
 
             # Leader STS (id=2) read request
-            MCC_l_sts.STSControl_read(CONTROLLER_ID, STS_ID_2)
+            sts2_val = motor_stream.read_angle(2)
 
             # Append STS id=1 pos (MCC_l_sts.sts_map is assumed to be filled after recv)
             # after requesting STS_ID_1, receive and then read it
-            MCC_l_sts.STSControl_read(CONTROLLER_ID, STS_ID_1)
-            MCC_l_sts.recv()
-            l.append(sts_value(MCC_l_sts.sts_map, STS_ID_1, 0.0))  # index 5
-            MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_1, l[5])
+            #MCC_l_sts.STSControl_read(CONTROLLER_ID, STS_ID_1)
+            #MCC_l_sts.recv()
+            l.append(sts1_val)  # index 5
+            #MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_1, l[5])
             # Mirror STS id=1 to follower
-            MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_1, l[5])
+            MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_1, sts1_val)
 
             # Follow leader DM -> follower DM
             for i in range(5):
                 mit_max_torque(MCC_f_dm, FOLLOWER_DM_MOTORS[i], l[i], K_P, 0.0, 1.0)
 
             # Receive STS (id=2) and mirror to follower
-            MCC_l_sts.recv()
             # request the second STS, receive and mirror it too
-            MCC_l_sts.STSControl_read(CONTROLLER_ID, STS_ID_2)
-            MCC_l_sts.recv()
-            l.append(sts_value(MCC_l_sts.sts_map, STS_ID_2, 0.0))  # index 6
-            MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_2, l[6])
-            MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_2, l[6])
+            l.append(sts2_val)  # index 6
+            MCC_f_sts.STSControl_write(CONTROLLER_ID, STS_ID_2, sts2_val)
 
             print([float(q) for q in l])
 
